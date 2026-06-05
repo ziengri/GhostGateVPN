@@ -13,6 +13,7 @@ class UserRead(BaseModel):
 
     id: UUID
     email: EmailStr
+    phone_number: str
     role: UserRole
     tgid: int | None
     is_active: bool
@@ -24,4 +25,3 @@ class AdminUserPatch(BaseModel):
     role: UserRole | None = None
     is_active: bool | None = None
     tgid: int | None = None
-

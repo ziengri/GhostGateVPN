@@ -41,7 +41,7 @@ async def _token_response(session: AsyncSession, user: User, request: Request | 
     return TokenResponse(access_token=access_token, refresh_token=refresh_token, user=user)
 
 
-async def register(session: AsyncSession, email: str, password: str, request: Request) -> TokenResponse:
+async def register(session: AsyncSession, email: str, phone_number: str, password: str, request: Request) -> TokenResponse:
     email = _normalize_email(email)
     existing = await session.scalar(select(User).where(User.email == email))
     if existing:
@@ -49,7 +49,7 @@ async def register(session: AsyncSession, email: str, password: str, request: Re
     plan = await session.scalar(select(Plan).where(Plan.code == "trial", Plan.is_active.is_(True)))
     if not plan:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="trial plan is not configured")
-    user = User(email=email, password_hash=hash_password(password), role=UserRole.user)
+    user = User(email=email, phone_number=phone_number, password_hash=hash_password(password), role=UserRole.user)
     session.add(user)
     await session.flush()
     now = datetime.now(UTC)

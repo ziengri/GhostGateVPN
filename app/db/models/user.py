@@ -19,6 +19,7 @@ class User(UuidPkMixin, TimestampMixin, Base):
     __tablename__ = "users"
 
     email: Mapped[str] = mapped_column(Text, unique=True, index=True, nullable=False)
+    phone_number: Mapped[str] = mapped_column(Text, nullable=False)
     password_hash: Mapped[str] = mapped_column(Text, nullable=False)
     role: Mapped[UserRole] = mapped_column(Enum(UserRole, name="user_role"), default=UserRole.user, nullable=False)
     tgid: Mapped[int | None] = mapped_column(BigInteger, unique=True, nullable=True)
@@ -28,4 +29,3 @@ class User(UuidPkMixin, TimestampMixin, Base):
 
     subscriptions = relationship("Subscription", back_populates="user")
     vpn_configs = relationship("VpnConfig", back_populates="user")
-

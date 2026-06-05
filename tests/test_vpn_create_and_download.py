@@ -18,7 +18,7 @@ class DummySession:
 
 @pytest.mark.asyncio
 async def test_create_and_download_reuses_existing_active_config(monkeypatch: pytest.MonkeyPatch) -> None:
-    user = User(id=uuid.uuid4(), email="user@example.com", password_hash="x", role=UserRole.user, is_active=True)
+    user = User(id=uuid.uuid4(), email="user@example.com", phone_number="+70000000007", password_hash="x", role=UserRole.user, is_active=True)
     config = VpnConfig(
         id=uuid.uuid4(),
         user_id=user.id,
@@ -51,7 +51,7 @@ async def test_create_and_download_reuses_existing_active_config(monkeypatch: py
 
 @pytest.mark.asyncio
 async def test_create_and_download_creates_when_no_active_config(monkeypatch: pytest.MonkeyPatch) -> None:
-    user = User(id=uuid.uuid4(), email="user@example.com", password_hash="x", role=UserRole.user, is_active=True)
+    user = User(id=uuid.uuid4(), email="user@example.com", phone_number="+70000000008", password_hash="x", role=UserRole.user, is_active=True)
     created_config = VpnConfig(
         id=uuid.uuid4(),
         user_id=user.id,
@@ -85,7 +85,7 @@ async def test_create_and_download_creates_when_no_active_config(monkeypatch: py
 
 @pytest.mark.asyncio
 async def test_create_and_download_rejects_blocked_user() -> None:
-    user = User(id=uuid.uuid4(), email="blocked@example.com", password_hash="x", role=UserRole.user, is_active=False)
+    user = User(id=uuid.uuid4(), email="blocked@example.com", phone_number="+70000000009", password_hash="x", role=UserRole.user, is_active=False)
 
     with pytest.raises(HTTPException) as exc:
         await vpn_service.create_and_download_config(DummySession(), user)
@@ -95,7 +95,7 @@ async def test_create_and_download_rejects_blocked_user() -> None:
 
 
 def test_create_and_download_route_returns_attachment(monkeypatch: pytest.MonkeyPatch) -> None:
-    user = User(id=uuid.uuid4(), email="user@example.com", password_hash="x", role=UserRole.user, is_active=True)
+    user = User(id=uuid.uuid4(), email="user@example.com", phone_number="+70000000010", password_hash="x", role=UserRole.user, is_active=True)
     config = VpnConfig(
         id=uuid.uuid4(),
         user_id=user.id,

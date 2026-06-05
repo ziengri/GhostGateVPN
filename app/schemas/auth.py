@@ -7,11 +7,13 @@ from app.schemas.user import UserRead
 
 class RegisterRequest(BaseModel):
     email: EmailStr
+    phone_number: str = Field(pattern=r"^\+7\d{10}$")
     password: str = Field(min_length=8, max_length=256)
 
 
-class LoginRequest(RegisterRequest):
-    pass
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str = Field(min_length=8, max_length=256)
 
 
 class RefreshRequest(BaseModel):
@@ -40,4 +42,3 @@ class PasswordResetRequest(BaseModel):
 class PasswordResetConfirm(BaseModel):
     token: str
     password: str = Field(min_length=8, max_length=256)
-

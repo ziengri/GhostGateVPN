@@ -24,6 +24,7 @@ def test_required_tables_are_mapped() -> None:
         "email_verification_tokens",
         "password_reset_tokens",
     }.issubset(Base.metadata.tables.keys())
+    assert "phone_number" in Base.metadata.tables["users"].columns.keys()
 
 
 def test_required_enum_values_exist() -> None:
@@ -36,4 +37,3 @@ def test_trial_plan_model_contract() -> None:
     assert plan.code == "trial"
     assert plan.duration_days == 14
     assert plan.max_configs == 1
-

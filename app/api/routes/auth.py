@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 @router.post("/register", response_model=TokenResponse)
 async def register(payload: RegisterRequest, request: Request, session: AsyncSession = Depends(get_db)) -> TokenResponse:
-    return await auth_service.register(session, payload.email, payload.password, request)
+    return await auth_service.register(session, payload.email, payload.phone_number, payload.password, request)
 
 
 @router.post("/login", response_model=TokenResponse)

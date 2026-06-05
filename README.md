@@ -31,6 +31,8 @@ OpenAPI is available at `http://localhost:8000/docs`.
 
 SMTP is disabled by default for local development. Set `SMTP_ENABLED=true` after configuring real SMTP credentials.
 
+`POST /auth/register` now requires `phone_number` in format `+70000000000`.
+
 Email verification links use:
 
 ```text
