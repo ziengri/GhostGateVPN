@@ -1,0 +1,949 @@
+Техническое задание
+Backend-сервис для выпуска VPN-конфигов AmneziaWG через awg-server
+1. Назначение проекта
+
+Необходимо разработать backend-сервис для управления пользователями, подписками и выпуском VPN-конфигов на базе AmneziaWG.
+
+Сервис должен взаимодействовать с уже существующим awg-server от StealthSurf-VPN/awg-server через API / готовую Python-библиотеку.
+
+Backend должен быть центральной точкой управления:
+
+пользователь → backend → awg-server
+
+Backend хранит пользователей, подписки, сроки действия VPN-конфигов и статусы.
+Технический VPN-конфиг не хранится в БД, а запрашивается у awg-server по awg_client_id.
+
+2. MVP-область проекта
+
+В рамках MVP нужно реализовать:
+
+регистрация по email/password
+авторизация по email/password
+JWT access token сроком на 2 часа
+refresh token с хранением в БД
+роли пользователей: user, admin, support
+trial-подписка на 14 дней
+один VPN-сервер awg-server
+выпуск VPN-конфига
+получение VPN-конфига
+ручной отзыв VPN-конфига
+автоматический отзыв просроченных конфигов
+хранение событий по VPN-конфигам
+
+В MVP не требуется:
+
+Telegram-бот
+полноценная Telegram-привязка через отдельные таблицы
+много VPN-нод
+платёжная система
+хранение тела VPN-конфига в БД
+хранение private/public/preshared ключей в БД
+
+Но в users нужно предусмотреть поле:
+
+tgid
+
+для будущей привязки Telegram-аккаунта.
+
+3. Рекомендуемый стек
+
+Backend:
+
+Python
+FastAPI
+SQLAlchemy 2.x
+Alembic
+PostgreSQL
+Pydantic
+JWT
+bcrypt или argon2 для паролей
+
+Фоновые задачи:
+
+Celery + Redis
+
+Допустимый упрощённый вариант для MVP:
+
+APScheduler
+
+но архитектура должна позволять заменить scheduler на Celery / Dramatiq / RQ.
+
+4. Основной принцип архитектуры
+
+Backend является источником истины по правам доступа.
+
+PostgreSQL хранит:
+- пользователей
+- роли
+- подписки
+- сроки действия
+- awg_client_id
+- статусы конфигов
+- историю событий
+
+awg-server хранит:
+- технические данные WireGuard/AmneziaWG-клиента
+- тело VPN-конфига
+- ключи
+
+Правило:
+
+БД — источник истины по доступу.
+awg-server — исполнитель создания/удаления VPN-клиентов.
+5. Сущности БД
+
+Нужно реализовать следующие таблицы:
+
+users
+refresh_tokens
+plans
+subscriptions
+vpn_configs
+vpn_config_events
+6. PostgreSQL enums
+6.1. user_role
+CREATE TYPE user_role AS ENUM (
+    'user',
+    'admin',
+    'support'
+);
+6.2. vpn_config_status
+CREATE TYPE vpn_config_status AS ENUM (
+    'active',
+    'pending_revoke',
+    'expired',
+    'revoked',
+    'failed'
+);
+
+Значения:
+
+active — конфиг активен
+pending_revoke — конфиг ожидает отзыва через awg-server
+expired — срок истёк, конфиг автоматически отозван
+revoked — конфиг отозван вручную пользователем или админом
+failed — ошибка создания или критичная ошибка жизненного цикла
+6.3. subscription_status
+CREATE TYPE subscription_status AS ENUM (
+    'active',
+    'expired',
+    'cancelled',
+    'trial'
+);
+7. Таблица users
+
+Назначение: хранение пользователей и базовой информации аккаунта.
+
+CREATE TABLE users (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
+    email TEXT UNIQUE NOT NULL,
+    password_hash TEXT NOT NULL,
+
+    role user_role NOT NULL DEFAULT 'user',
+
+    tgid BIGINT UNIQUE,
+
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    is_email_verified BOOLEAN NOT NULL DEFAULT FALSE,
+
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_login_at TIMESTAMPTZ
+);
+
+Индексы:
+
+CREATE UNIQUE INDEX idx_users_email ON users(email);
+CREATE UNIQUE INDEX idx_users_tgid ON users(tgid) WHERE tgid IS NOT NULL;
+
+Требования:
+
+email должен быть уникальным
+password_hash хранит только hash пароля
+role по умолчанию user
+tgid nullable, нужен для будущей Telegram-интеграции
+is_active используется для блокировки пользователя
+8. Таблица refresh_tokens
+
+Назначение: хранение refresh token для авторизации.
+
+Access token в БД не хранится.
+
+CREATE TABLE refresh_tokens (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+
+    token_hash TEXT NOT NULL,
+
+    expires_at TIMESTAMPTZ NOT NULL,
+    revoked_at TIMESTAMPTZ,
+
+    user_agent TEXT,
+    ip_address INET,
+
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+Индексы:
+
+CREATE INDEX idx_refresh_tokens_user_id ON refresh_tokens(user_id);
+CREATE INDEX idx_refresh_tokens_token_hash ON refresh_tokens(token_hash);
+CREATE INDEX idx_refresh_tokens_expires_at ON refresh_tokens(expires_at);
+
+Требования:
+
+access token TTL = 2 часа
+refresh token хранить только в виде hash
+refresh token TTL можно задать 30 дней
+logout должен проставлять revoked_at
+refresh endpoint должен проверять token_hash, expires_at и revoked_at
+9. Таблица plans
+
+Назначение: тарифные планы.
+
+В MVP должен быть один тариф:
+
+code: trial
+name: Trial 14 days
+duration_days: 14
+max_configs: 1
+price_amount: 0
+currency: RUB
+
+Схема:
+
+CREATE TABLE plans (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
+    code TEXT UNIQUE NOT NULL,
+    name TEXT NOT NULL,
+
+    duration_days INTEGER NOT NULL,
+    max_configs INTEGER NOT NULL DEFAULT 1,
+
+    price_amount INTEGER NOT NULL DEFAULT 0,
+    currency TEXT NOT NULL DEFAULT 'RUB',
+
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+Seed:
+
+INSERT INTO plans (
+    code,
+    name,
+    duration_days,
+    max_configs,
+    price_amount,
+    currency,
+    is_active
+)
+VALUES (
+    'trial',
+    'Trial 14 days',
+    14,
+    1,
+    0,
+    'RUB',
+    TRUE
+);
+10. Таблица subscriptions
+
+Назначение: подписки пользователей.
+
+При регистрации каждому пользователю автоматически создаётся trial-подписка на 14 дней.
+
+CREATE TABLE subscriptions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    plan_id UUID NOT NULL REFERENCES plans(id),
+
+    status subscription_status NOT NULL DEFAULT 'trial',
+
+    starts_at TIMESTAMPTZ NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL,
+
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+Индексы:
+
+CREATE INDEX idx_subscriptions_user_id ON subscriptions(user_id);
+CREATE INDEX idx_subscriptions_status ON subscriptions(status);
+CREATE INDEX idx_subscriptions_expires_at ON subscriptions(expires_at);
+
+CREATE UNIQUE INDEX idx_one_active_subscription_per_user
+ON subscriptions(user_id)
+WHERE status IN ('active', 'trial');
+
+Требования:
+
+у одного пользователя может быть только одна активная/trial подписка
+trial создаётся автоматически при регистрации
+starts_at = now()
+expires_at = now() + interval '14 days'
+11. Таблица vpn_configs
+
+Назначение: хранение связи пользователя с VPN-клиентом в awg-server.
+
+В БД не нужно хранить:
+
+тело конфига
+private key
+public key
+preshared key
+config name
+vpn node
+
+Храним только awg_client_id, по которому backend может обратиться к awg-server.
+
+CREATE TABLE vpn_configs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    subscription_id UUID REFERENCES subscriptions(id) ON DELETE SET NULL,
+
+    awg_client_id TEXT UNIQUE NOT NULL,
+
+    status vpn_config_status NOT NULL DEFAULT 'active',
+
+    starts_at TIMESTAMPTZ NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL,
+    revoked_at TIMESTAMPTZ,
+
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_sync_at TIMESTAMPTZ
+);
+
+Индексы:
+
+CREATE INDEX idx_vpn_configs_user_id ON vpn_configs(user_id);
+CREATE INDEX idx_vpn_configs_subscription_id ON vpn_configs(subscription_id);
+CREATE INDEX idx_vpn_configs_status ON vpn_configs(status);
+CREATE INDEX idx_vpn_configs_expires_at ON vpn_configs(expires_at);
+CREATE INDEX idx_vpn_configs_awg_client_id ON vpn_configs(awg_client_id);
+
+CREATE INDEX idx_vpn_configs_active_expiring
+ON vpn_configs(expires_at)
+WHERE status = 'active';
+
+Требования:
+
+awg_client_id уникальный
+config.expires_at должен быть равен subscription.expires_at
+конфиг может быть скачан только если status = active и expires_at > now()
+после истечения срока конфиг должен быть отозван через awg-server
+
+Лимит активных конфигов:
+
+проверять в коде через plans.max_configs
+для trial max_configs = 1
+12. Таблица vpn_config_events
+
+Назначение: хранение истории событий по VPN-конфигам.
+
+CREATE TABLE vpn_config_events (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
+    config_id UUID REFERENCES vpn_configs(id) ON DELETE CASCADE,
+    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+
+    event_type TEXT NOT NULL,
+    message TEXT,
+    metadata JSONB,
+
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+Индексы:
+
+CREATE INDEX idx_vpn_config_events_config_id ON vpn_config_events(config_id);
+CREATE INDEX idx_vpn_config_events_user_id ON vpn_config_events(user_id);
+CREATE INDEX idx_vpn_config_events_event_type ON vpn_config_events(event_type);
+CREATE INDEX idx_vpn_config_events_created_at ON vpn_config_events(created_at);
+
+Примеры event_type:
+
+created
+awg_created
+config_requested
+downloaded
+pending_revoke
+expired
+revoked
+revoke_failed
+subscription_expired
+sync_failed
+13. Авторизация
+13.1. Регистрация
+SMTP в архитектуре
+
+SMTP лучше не размазывать по коду. Делаем отдельный сервис:
+
+EmailService
+  send_email()
+  send_verify_email()
+  send_password_reset_email()
+  send_trial_started_email()
+  send_config_created_email()
+
+Для MVP нужны минимум:
+
+подтверждение email — можно позже
+сброс пароля — лучше сразу предусмотреть
+
+6. Таблица для email-подтверждения
+
+Раз у нас есть is_email_verified, лучше сразу предусмотреть токены.
+
+CREATE TABLE email_verification_tokens (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+
+    token_hash TEXT NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL,
+    used_at TIMESTAMPTZ,
+
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+Индексы:
+
+CREATE INDEX idx_email_verification_tokens_user_id
+ON email_verification_tokens(user_id);
+
+CREATE INDEX idx_email_verification_tokens_token_hash
+ON email_verification_tokens(token_hash);
+
+Ссылка в письме:
+
+https://example.com/verify-email?token=...
+
+или API-вариант:
+
+POST /auth/email/verify
+7. Таблица для сброса пароля
+CREATE TABLE password_reset_tokens (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+
+    token_hash TEXT NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL,
+    used_at TIMESTAMPTZ,
+
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+Индексы:
+
+CREATE INDEX idx_password_reset_tokens_user_id
+ON password_reset_tokens(user_id);
+
+CREATE INDEX idx_password_reset_tokens_token_hash
+ON password_reset_tokens(token_hash);
+
+Endpoints:
+
+POST /auth/password-reset/request
+POST /auth/password-reset/confirm
+
+Endpoint:
+
+POST /auth/register
+
+Вход:
+
+{
+  "email": "user@example.com",
+  "password": "password"
+}
+
+Логика:
+
+1. проверить уникальность email
+2. захешировать пароль
+3. создать пользователя с role=user
+4. найти plan с code=trial
+5. создать subscription:
+   - status=trial
+   - starts_at=now()
+   - expires_at=now() + 14 days
+6. создать access token на 2 часа
+7. создать refresh token
+8. сохранить hash refresh token в БД
+9. вернуть access token, refresh token и данные пользователя
+13.2. Логин
+
+Endpoint:
+
+POST /auth/login
+
+Логика:
+
+1. найти пользователя по email
+2. проверить пароль
+3. проверить is_active = true
+4. обновить last_login_at
+5. создать access token на 2 часа
+6. создать refresh token
+7. сохранить hash refresh token в БД
+8. вернуть tokens
+13.3. Refresh
+
+Endpoint:
+
+POST /auth/refresh
+
+Логика:
+
+1. принять refresh token
+2. посчитать hash
+3. найти refresh_tokens.token_hash
+4. проверить expires_at > now()
+5. проверить revoked_at IS NULL
+6. выпустить новый access token
+7. желательно сделать rotation refresh token:
+   - старый refresh token revoke
+   - новый refresh token сохранить
+13.4. Logout
+
+Endpoint:
+
+POST /auth/logout
+
+Логика:
+
+1. принять refresh token
+2. найти token_hash
+3. выставить revoked_at = now()
+13.5. Me
+
+Endpoint:
+
+GET /me
+
+Возвращает текущего пользователя:
+
+{
+  "id": "uuid",
+  "email": "user@example.com",
+  "role": "user",
+  "tgid": null,
+  "is_active": true,
+  "is_email_verified": false,
+  "created_at": "..."
+}
+14. VPN endpoints
+14.1. Список конфигов пользователя
+GET /vpn/configs
+
+Возвращает только конфиги текущего пользователя.
+
+14.2. Создать VPN-конфиг
+POST /vpn/configs
+
+Логика:
+
+1. проверить, что пользователь active
+2. найти активную/trial подписку пользователя
+3. проверить subscription.expires_at > now()
+4. получить plan
+5. посчитать количество active-конфигов пользователя
+6. проверить active_configs_count < plan.max_configs
+7. вызвать awg-server API create client
+8. получить awg_client_id
+9. создать vpn_configs:
+   - user_id
+   - subscription_id
+   - awg_client_id
+   - status=active
+   - starts_at=now()
+   - expires_at=subscription.expires_at
+10. создать vpn_config_event:
+   - event_type=created
+   - event_type=awg_created
+11. вернуть созданный config object
+14.3. Получить информацию о конфиге
+GET /vpn/configs/{id}
+
+Права:
+
+user может получить только свой конфиг
+admin/support могут получить любой конфиг
+14.4. Скачать VPN-конфиг
+GET /vpn/configs/{id}/download
+
+Логика:
+
+1. найти vpn_config
+2. проверить права доступа
+3. проверить status = active
+4. проверить expires_at > now()
+5. если expires_at <= now():
+   - не отдавать конфиг
+   - перевести config в pending_revoke
+6. вызвать awg-server API get config by awg_client_id
+7. вернуть .conf файл или текст конфига
+8. создать vpn_config_event:
+   - event_type=config_requested или downloaded
+14.5. Отозвать VPN-конфиг пользователем
+POST /vpn/configs/{id}/revoke
+
+Логика:
+
+1. найти vpn_config
+2. проверить, что config.user_id = current_user.id
+3. если status уже revoked/expired:
+   - вернуть already_revoked
+4. перевести status=pending_revoke
+5. вызвать awg-server API delete/revoke client по awg_client_id
+6. если успешно:
+   - status=revoked
+   - revoked_at=now()
+   - event_type=revoked
+7. если ошибка:
+   - оставить pending_revoke
+   - event_type=revoke_failed
+   - вернуть ошибку или статус pending_revoke
+
+Endpoint должен быть idempotent.
+
+15. Subscription endpoints
+15.1. Текущая подписка
+GET /subscriptions/current
+
+Возвращает активную или trial-подписку пользователя.
+
+15.2. Список тарифов
+GET /plans
+
+В MVP возвращает только trial-тариф.
+
+16. Admin endpoints
+
+Доступ только для ролей:
+
+admin
+support
+
+При этом критичные операции изменения можно ограничить только admin.
+
+16.1. Пользователи
+GET /admin/users
+GET /admin/users/{id}
+PATCH /admin/users/{id}
+
+Через PATCH /admin/users/{id} нужно позволить:
+
+изменить role
+изменить is_active
+изменить tgid
+16.2. Конфиги
+GET /admin/configs
+GET /admin/configs/{id}
+POST /admin/configs/{id}/revoke
+
+POST /admin/configs/{id}/revoke должен отзывать конфиг любого пользователя.
+
+16.3. Подписки
+GET /admin/subscriptions
+PATCH /admin/subscriptions/{id}
+
+Через PATCH /admin/subscriptions/{id} можно менять:
+
+status
+expires_at
+
+Если expires_at уменьшается и становится меньше текущего времени, связанные активные конфиги должны быть переведены в pending_revoke или отозваны.
+
+17. Интеграция с awg-server
+
+Есть готовый клиент в папке /awg_client
+
+Конфигурация подключения к awg-server должна храниться в env:
+
+AWG_API_BASE_URL=
+AWG_API_TOKEN=
+AWG_TIMEOUT_SECONDS=10
+18. Фоновые задачи
+18.1. Автоматический отзыв просроченных конфигов
+
+Периодичность:
+
+каждые 1–5 минут
+
+Логика:
+
+1. найти configs:
+   status = active
+   expires_at <= now()
+2. перевести config в pending_revoke
+3. вызвать awg-server revoke_client(awg_client_id)
+4. если успешно:
+   - status=expired
+   - revoked_at=now()
+   - event_type=expired
+5. если ошибка:
+   - оставить pending_revoke
+   - event_type=revoke_failed
+   - сохранить ошибку в metadata
+
+SQL:
+
+SELECT *
+FROM vpn_configs
+WHERE status = 'active'
+  AND expires_at <= now()
+LIMIT 100;
+18.2. Повторный отзыв pending_revoke
+
+Периодичность:
+
+каждые 1–5 минут
+
+Логика:
+
+1. найти configs:
+   status = pending_revoke
+2. повторить revoke_client
+3. при успехе:
+   - если expires_at <= now(), status=expired
+   - иначе status=revoked
+4. при ошибке:
+   - создать event_type=revoke_failed
+18.3. Истечение подписок
+
+Периодичность:
+
+каждые 5–15 минут
+
+Логика:
+
+1. найти subscriptions:
+   status IN ('active', 'trial')
+   expires_at <= now()
+2. выставить status=expired
+3. связанные active vpn_configs перевести в pending_revoke
+4. создать события subscription_expired
+19. Бизнес-правила MVP
+1. При регистрации пользователь получает trial-подписку на 14 дней.
+
+2. Trial-подписка позволяет создать максимум 1 активный VPN-конфиг.
+
+3. VPN-конфиг живёт до конца подписки.
+
+4. VPN-конфиг нельзя скачать, если:
+   - пользователь заблокирован
+   - подписка истекла
+   - config.status != active
+   - config.expires_at <= now()
+
+5. Истёкший конфиг должен быть отозван через awg-server.
+
+6. Ручной отзыв должен быть idempotent:
+   повторный revoke не должен ломать систему.
+
+7. БД не хранит тело VPN-конфига.
+
+8. БД не хранит ключи VPN-клиента.
+
+9. Backend получает конфиг у awg-server по awg_client_id.
+
+10. Все важные действия по конфигу пишутся в vpn_config_events.
+20. Ошибки и статусы API
+
+Рекомендуемые ошибки:
+
+400 Bad Request — некорректный запрос
+401 Unauthorized — нет или неверный access token
+403 Forbidden — нет прав
+404 Not Found — объект не найден
+409 Conflict — превышен лимит конфигов / email уже занят
+422 Validation Error — ошибка валидации
+500 Internal Server Error — внутренняя ошибка
+502 Bad Gateway — ошибка awg-server
+
+Примеры ситуаций:
+
+email already exists → 409
+invalid credentials → 401
+user blocked → 403
+subscription expired → 403
+config limit exceeded → 409
+config not active → 409
+awg-server unavailable → 502
+21. Минимальная структура проекта
+app/
+  main.py
+
+  core/
+    config.py
+    security.py
+    jwt.py
+
+  db/
+    base.py
+    session.py
+    models/
+      user.py
+      refresh_token.py
+      plan.py
+      subscription.py
+      vpn_config.py
+      vpn_config_event.py
+    migrations/
+
+  api/
+    deps.py
+    routes/
+      auth.py
+      me.py
+      vpn_configs.py
+      plans.py
+      subscriptions.py
+      admin_users.py
+      admin_configs.py
+      admin_subscriptions.py
+
+  schemas/
+    auth.py
+    user.py
+    plan.py
+    subscription.py
+    vpn_config.py
+
+  services/
+    auth_service.py
+    user_service.py
+    subscription_service.py
+    vpn_service.py
+    awg_service.py
+
+  workers/
+    revoke_expired_configs.py
+    expire_subscriptions.py
+22. Минимальные env-переменные
+APP_ENV=local
+APP_SECRET_KEY=
+DATABASE_URL=postgresql+asyncpg://user:password@localhost:5432/dbname
+
+JWT_ACCESS_TOKEN_EXPIRE_MINUTES=120
+JWT_REFRESH_TOKEN_EXPIRE_DAYS=30
+
+AWG_API_BASE_URL=
+AWG_API_TOKEN=
+AWG_TIMEOUT_SECONDS=10
+
+23. Требования к безопасности
+пароли хранить только в виде hash
+использовать bcrypt или argon2
+refresh token хранить только в виде hash
+JWT подписывать через APP_SECRET_KEY
+admin endpoints защищать по role
+проверять ownership конфигов
+не отдавать конфиг после expires_at
+не хранить тело VPN-конфига в БД
+не логировать VPN-конфиг и приватные ключи
+AWG_API_TOKEN хранить только в env
+24. Что должно быть готово на выходе
+
+После реализации MVP должны быть готовы:
+
+1. PostgreSQL schema через Alembic migrations
+2. SQLAlchemy models
+3. Pydantic schemas
+4. Auth endpoints
+5. User / me endpoint
+6. Plans endpoint
+7. Subscription current endpoint
+8. VPN config endpoints
+9. Admin endpoints
+10. AwgService integration layer
+11. Worker для автоотзыва истёкших конфигов
+12. Worker для истечения подписок
+13. Seed trial-тарифа
+14. README с инструкцией запуска
+15. .env.example
+
+26. Краткое резюме для ИИ-разработчика
+
+Нужно сделать FastAPI backend для VPN-сервиса.
+
+Пользователь регистрируется по email/password, получает trial-подписку на 14 дней и может создать 1 VPN-конфиг.
+
+Backend создаёт клиента в awg-server, сохраняет в БД только awg_client_id, срок действия и статус. Сам VPN-конфиг и ключи в БД не хранятся. При скачивании backend запрашивает конфиг у awg-server по awg_client_id.
+
+Когда срок действия подписки или конфига истёк, backend должен автоматически отозвать клиента в awg-server.
+
+Нужны роли user, admin, support, JWT access token на 2 часа, refresh tokens в БД, PostgreSQL, SQLAlchemy, Alembic и фоновые задачи.
+
+
+Тогда добавляем инфраструктурный слой: docker-compose для backend, БД,  AWG остаётся внешним сервисом, а SMTP лучше оформить как отдельный EmailService с настройками через .env.
+
+Docker Compose:
+  backend API
+  PostgreSQL
+   ...
+
+   ВНЕ Docker Compose:
+  awg-server
+
+awg-server уже стоит на сервере и доступен, например, по:
+
+http://127.0.0.1:7777
+
+Но важный момент: изнутри Docker-контейнера 127.0.0.1 — это сам контейнер, а не хост-сервер.
+Как Docker будет ходить к awg-server через host.docker.internal
+
+На Linux это нужно явно добавить в docker-compose.yml:
+
+extra_hosts:
+  - "host.docker.internal:host-gateway"
+
+Тогда в .env:
+
+AWG_API_BASE_URL=http://host.docker.internal:7777
+
+.env  Файл
+# App
+APP_NAME=VPN Service
+APP_HOST=0.0.0.0
+APP_PORT=8000
+APP_PUBLIC_URL=http://localhost:8000
+
+# Security
+SECRET_KEY=change-me-super-secret
+ACCESS_TOKEN_EXPIRE_MINUTES=120
+REFRESH_TOKEN_EXPIRE_DAYS=30
+
+# PostgreSQL
+POSTGRES_DB=vpn_service
+POSTGRES_USER=vpn_user
+POSTGRES_PASSWORD=vpn_password
+
+DATABASE_URL=postgresql+asyncpg://vpn_user:vpn_password@postgres:5432/vpn_service
+
+# AWG Server
+AWG_API_BASE_URL=http://host.docker.internal:7777
+AWG_API_TOKEN=change-me-awg-token
+AWG_REQUEST_TIMEOUT_SECONDS=10
+
+# SMTP
+SMTP_HOST=smtp.example.com
+SMTP_PORT=587
+SMTP_USERNAME=your-smtp-user
+SMTP_PASSWORD=your-smtp-password
+SMTP_FROM_EMAIL=no-reply@example.com
+SMTP_FROM_NAME=VPN Service
+SMTP_USE_TLS=true
+SMTP_USE_SSL=false
