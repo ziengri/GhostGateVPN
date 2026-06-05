@@ -4,7 +4,7 @@ import uuid
 from datetime import UTC, datetime
 
 from fastapi import HTTPException, status
-from sqlalchemy import func, select
+from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import Plan, Subscription, SubscriptionStatus, User, UserRole, VpnConfig, VpnConfigEvent, VpnConfigStatus
@@ -77,6 +77,18 @@ async def create_config(session: AsyncSession, user: User, awg_service: AwgServi
     return config
 
 
+async def get_reusable_active_config(session: AsyncSession, user_id: uuid.UUID) -> VpnConfig | None:
+    return await session.scalar(
+        select(VpnConfig)
+        .where(
+            VpnConfig.user_id == user_id,
+            VpnConfig.status == VpnConfigStatus.active,
+            VpnConfig.expires_at > now_utc(),
+        )
+        .order_by(desc(VpnConfig.created_at))
+    )
+
+
 async def get_config_for_user(session: AsyncSession, config_id: uuid.UUID, user: User) -> VpnConfig:
     config = await session.get(VpnConfig, config_id)
     if not config:
@@ -86,10 +98,7 @@ async def get_config_for_user(session: AsyncSession, config_id: uuid.UUID, user:
     return config
 
 
-async def download_config(session: AsyncSession, config_id: uuid.UUID, user: User, awg_service: AwgService | None = None) -> str:
-    if not user.is_active:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="user blocked")
-    config = await get_config_for_user(session, config_id, user)
+async def download_config_body(session: AsyncSession, config: VpnConfig, awg_service: AwgService | None = None) -> str:
     if config.status != VpnConfigStatus.active:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="config not active")
     if config.expires_at <= now_utc():
@@ -107,6 +116,25 @@ async def download_config(session: AsyncSession, config_id: uuid.UUID, user: Use
     await log_config_event(session, config, config.user_id, "downloaded")
     await session.commit()
     return body
+
+
+async def download_config(session: AsyncSession, config_id: uuid.UUID, user: User, awg_service: AwgService | None = None) -> str:
+    if not user.is_active:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="user blocked")
+    config = await get_config_for_user(session, config_id, user)
+    return await download_config_body(session, config, awg_service=awg_service)
+
+
+async def create_and_download_config(
+    session: AsyncSession, user: User, awg_service: AwgService | None = None
+) -> tuple[VpnConfig, str]:
+    if not user.is_active:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="user blocked")
+    config = await get_reusable_active_config(session, user.id)
+    if config is None:
+        config = await create_config(session, user, awg_service=awg_service)
+    body = await download_config_body(session, config, awg_service=awg_service)
+    return config, body
 
 
 async def revoke_config(
@@ -136,4 +164,3 @@ async def revoke_config(
     await session.commit()
     await session.refresh(config)
     return config
-

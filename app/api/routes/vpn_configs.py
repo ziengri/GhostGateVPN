@@ -26,6 +26,16 @@ async def create_config(user: User = Depends(get_current_user), session: AsyncSe
     return await vpn_service.create_config(session, user)
 
 
+@router.post("/create-and-download")
+async def create_and_download_config(user: User = Depends(get_current_user), session: AsyncSession = Depends(get_db)) -> Response:
+    config, body = await vpn_service.create_and_download_config(session, user)
+    return Response(
+        content=body,
+        media_type="application/x-wireguard-profile",
+        headers={"Content-Disposition": f'attachment; filename="ghostgate-{config.id}.conf"'},
+    )
+
+
 @router.get("/{config_id}", response_model=VpnConfigRead)
 async def get_config(config_id: UUID, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_db)) -> VpnConfig:
     return await vpn_service.get_config_for_user(session, config_id, user)
@@ -49,4 +59,3 @@ async def revoke_config(config_id: UUID, user: User = Depends(get_current_user),
 
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="forbidden")
     return await vpn_service.revoke_config(session, config, actor=user)
-

@@ -21,6 +21,7 @@ def test_health_and_openapi_routes() -> None:
         "/plans",
         "/subscriptions/current",
         "/vpn/configs",
+        "/vpn/configs/create-and-download",
         "/vpn/configs/{config_id}/download",
         "/vpn/configs/{config_id}/revoke",
         "/admin/users",
@@ -30,3 +31,4 @@ def test_health_and_openapi_routes() -> None:
         assert path in paths
     assert "get" in paths["/auth/email/verify"]
     assert "post" in paths["/auth/email/verify"]
+    assert "post" in paths["/vpn/configs/create-and-download"]
